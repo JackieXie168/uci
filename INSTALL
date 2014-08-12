@@ -1,0 +1,65 @@
+Using UCI on Mac OS X
+
+The following HOWTO introduces the building of UCI (Unified Configuration Interface) on Mac OS X.
+
+
+	1.Some extra package are required:
+
+		$ sudo port install lua cmake
+
+	2.The libubox library is required. It should to compiled from source. To do this, first you have to get the source from git:  
+
+		$ git clone git://nbd.name/luci2/libubox.git
+		$ cd libubox
+
+	3. Please follow the next steps to build libubox:
+
+		$ mkdir build
+		$ cd build
+		$ cmake ..
+		$ make ubox
+
+	4. Install libubox:
+
+		$ sudo mkdir -p /opt/local/include/libubox
+		$ sudo cp ../*.h /opt/local/include/libubox
+		$ sudo cp libubox.dylib /opt/local/lib
+
+	5. Get UCI source from git:
+
+		$ git clone git://nbd.name/uci.git uci
+		$ cd uci
+
+	6.Please follow the next steps to build uci:
+
+		$ mkdir build
+		$ cd build
+		$ cmake ..
+		$ make uci cli
+
+	7.Install uci:
+
+		$ sudo mkdir -p /opt/local/include/uci
+		$ sudo cp ../uci.h ../uci_config.h /opt/local/include/uci
+		$ sudo cp ../uci_blob.h ../ucimap.h /opt/local/include/uci
+		$ sudo cp libuci.dylib /opt/local/lib
+		$ sudo cp uci /opt/local/bin
+
+	8.Testing:
+
+		$ mkdir test
+		$ cat > test/test << EOF
+		> config 'test' 'abc'
+		> option 'test_var' 'value'
+		> EOF
+
+		$ uci -c `pwd`/test show test
+		test.abc=test
+		test.abc.test_var=value
+		$ uci -c `pwd`/test set test.abc.test_var=foobar
+		$ uci -c `pwd`/test commit test
+		$ uci -c `pwd`/test show test
+		test.abc=test
+		test.abc.test_var=foobar
+
+
