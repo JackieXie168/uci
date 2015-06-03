@@ -14,6 +14,8 @@
 #include <strings.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
+#include <errno.h>
 #include <unistd.h>
 #include "uci.h"
 
@@ -168,18 +170,53 @@ static void cli_perror(void)
 	uci_perror(ctx, appname);
 }
 
-static void uci_show_value(struct uci_option *o)
+static void cli_error(const char *fmt, ...)
+{
+	va_list ap;
+
+	if (flags & CLI_FLAG_QUIET)
+		return;
+
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+}
+
+static void uci_print_value(FILE *f, const char *v)
+{
+	fprintf(f, "'");
+	while (*v) {
+		if (*v != '\'')
+			fputc(*v, f);
+		else
+			fprintf(f, "'\\''");
+		v++;
+	}
+	fprintf(f, "'");
+}
+
+static void uci_show_value(struct uci_option *o, bool quote)
 {
 	struct uci_element *e;
 	bool sep = false;
+	char *space;
 
 	switch(o->type) {
 	case UCI_TYPE_STRING:
-		printf("%s\n", o->v.string);
+		if (quote)
+			uci_print_value(stdout, o->v.string);
+		else
+			printf("%s", o->v.string);
+		printf("\n");
 		break;
 	case UCI_TYPE_LIST:
 		uci_foreach_element(&o->v.list, e) {
-			printf("%s%s", (sep ? delimiter : ""), e->name);
+			printf("%s", (sep ? delimiter : ""));
+			space = strpbrk(e->name, " \t\r\n");
+			if (!space && !quote)
+				printf("%s", e->name);
+			else
+				uci_print_value(stdout, e->name);
 			sep = true;
 		}
 		printf("\n");
@@ -190,13 +227,13 @@ static void uci_show_value(struct uci_option *o)
 	}
 }
 
-static void uci_show_option(struct uci_option *o)
+static void uci_show_option(struct uci_option *o, bool quote)
 {
 	printf("%s.%s.%s=",
 		o->section->package->e.name,
 		(cur_section_ref ? cur_section_ref : o->section->e.name),
 		o->e.name);
-	uci_show_value(o);
+	uci_show_value(o, quote);
 }
 
 static void uci_show_section(struct uci_section *s)
@@ -209,7 +246,7 @@ static void uci_show_section(struct uci_section *s)
 	sname = (cur_section_ref ? cur_section_ref : s->e.name);
 	printf("%s.%s=%s\n", cname, sname, s->type);
 	uci_foreach_element(&s->options, e) {
-		uci_show_option(uci_to_option(e));
+		uci_show_option(uci_to_option(e), true);
 	}
 }
 
@@ -251,8 +288,10 @@ static void uci_show_changes(struct uci_package *p)
 		printf("%s%s.%s", prefix, p->e.name, h->section);
 		if (e->name)
 			printf(".%s", e->name);
-		if (h->cmd != UCI_CMD_REMOVE)
-			printf("%s%s", op, h->value);
+		if (h->cmd != UCI_CMD_REMOVE) {
+			printf("%s", op);
+			uci_print_value(stdout, h->value);
+		}
 		printf("\n");
 	}
 }
@@ -261,7 +300,7 @@ static int package_cmd(int cmd, char *tuple)
 {
 	struct uci_element *e = NULL;
 	struct uci_ptr ptr;
-	int ret = 0;
+	int ret = 1;
 
 	if (uci_lookup_ptr(ctx, &ptr, tuple, true) != UCI_OK) {
 		cli_perror();
@@ -274,21 +313,25 @@ static int package_cmd(int cmd, char *tuple)
 		uci_show_changes(ptr.p);
 		break;
 	case CMD_COMMIT:
-		if (flags & CLI_FLAG_NOCOMMIT)
-			return 0;
+		if (flags & CLI_FLAG_NOCOMMIT) {
+			ret = 0;
+			goto out;
+		}
 		if (uci_commit(ctx, &ptr.p, false) != UCI_OK) {
 			cli_perror();
-			ret = 1;
+			goto out;
 		}
 		break;
 	case CMD_EXPORT:
-		uci_export(ctx, stdout, ptr.p, true);
+		if (uci_export(ctx, stdout, ptr.p, true) != UCI_OK) {
+			goto out;
+		}
 		break;
 	case CMD_SHOW:
 		if (!(ptr.flags & UCI_LOOKUP_COMPLETE)) {
 			ctx->err = UCI_ERR_NOTFOUND;
 			cli_perror();
-			ret = 1;
+			goto out;
 		}
 		switch(e->type) {
 			case UCI_TYPE_PACKAGE:
@@ -298,15 +341,18 @@ static int package_cmd(int cmd, char *tuple)
 				uci_show_section(ptr.s);
 				break;
 			case UCI_TYPE_OPTION:
-				uci_show_option(ptr.o);
+				uci_show_option(ptr.o, true);
 				break;
 			default:
 				/* should not happen */
-				return 1;
+				goto out;
 		}
 		break;
 	}
 
+	ret = 0;
+
+out:
 	if (ptr.p)
 		uci_unload(ctx, ptr.p);
 	return ret;
@@ -360,6 +406,7 @@ static int uci_do_package_cmd(int cmd, int argc, char **argv)
 {
 	char **configs = NULL;
 	char **p;
+	int ret = 1;
 
 	if (argc > 2)
 		return 255;
@@ -369,14 +416,17 @@ static int uci_do_package_cmd(int cmd, int argc, char **argv)
 
 	if ((uci_list_configs(ctx, &configs) != UCI_OK) || !configs) {
 		cli_perror();
-		return 1;
+		goto out;
 	}
 
 	for (p = configs; *p; p++) {
 		package_cmd(cmd, *p);
 	}
 
-	return 0;
+	ret = 0;
+out:
+	free(configs);
+	return ret;
 }
 
 static int uci_do_add(int argc, char **argv)
@@ -440,7 +490,7 @@ static int uci_do_section_cmd(int cmd, int argc, char **argv)
 			printf("%s\n", ptr.s->type);
 			break;
 		case UCI_TYPE_OPTION:
-			uci_show_value(ptr.o);
+			uci_show_value(ptr.o, false);
 			break;
 		default:
 			break;
@@ -502,7 +552,7 @@ static int uci_batch_cmd(void)
 
 	for(i = 0; i <= MAX_ARGS; i++) {
 		if (i == MAX_ARGS) {
-			fprintf(stderr, "Too many arguments\n");
+			cli_error("Too many arguments\n");
 			return 1;
 		}
 		argv[i] = NULL;
@@ -515,7 +565,7 @@ static int uci_batch_cmd(void)
 			break;
 		argv[i] = strdup(argv[i]);
 		if (!argv[i]) {
-			perror("uci");
+			cli_error("uci: %s", strerror(errno));
 			return 1;
 		}
 	}
@@ -547,7 +597,7 @@ static int uci_batch(void)
 		if (ret == 254)
 			return 0;
 		else if (ret == 255)
-			fprintf(stderr, "Unknown command\n");
+			cli_error("Unknown command\n");
 
 		/* clean up */
 		uci_foreach_element_safe(&ctx->root, tmp, e) {
@@ -637,7 +687,7 @@ int main(int argc, char **argv)
 	input = stdin;
 	ctx = uci_alloc_context();
 	if (!ctx) {
-		fprintf(stderr, "Out of memory\n");
+		cli_error("Out of memory\n");
 		return 1;
 	}
 
@@ -651,13 +701,14 @@ int main(int argc, char **argv)
 				break;
 			case 'f':
 				if (input != stdin) {
-					perror("uci");
+					fclose(input);
+					cli_error("Too many input files.\n");
 					return 1;
 				}
 
 				input = fopen(optarg, "r");
 				if (!input) {
-					perror("uci");
+					cli_error("uci: %s", strerror(errno));
 					return 1;
 				}
 				break;
