@@ -33,7 +33,13 @@ struct uci_parse_context
 	const char *name;
 	char *buf;
 	int bufsz;
+	int pos;
 };
+#define pctx_pos(pctx)		((pctx)->pos)
+#define pctx_str(pctx, i)	(&(pctx)->buf[(i)])
+#define pctx_cur_str(pctx)	pctx_str(pctx, pctx_pos(pctx))
+#define pctx_char(pctx, i)	((pctx)->buf[(i)])
+#define pctx_cur_char(pctx)	pctx_char(pctx, pctx_pos(pctx))
 
 extern const char *uci_confdir;
 extern const char *uci_savedir;
@@ -41,7 +47,7 @@ extern const char *uci_savedir;
 __private void *uci_malloc(struct uci_context *ctx, size_t size);
 __private void *uci_realloc(struct uci_context *ctx, void *ptr, size_t size);
 __private char *uci_strdup(struct uci_context *ctx, const char *str);
-__private bool uci_validate_str(const char *str, bool name);
+__private bool uci_validate_str(const char *str, bool name, bool package);
 __private void uci_add_delta(struct uci_context *ctx, struct uci_list *list, int cmd, const char *section, const char *option, const char *value);
 __private void uci_free_delta(struct uci_delta *h);
 __private struct uci_package *uci_alloc_package(struct uci_context *ctx, const char *name);
@@ -50,7 +56,7 @@ __private FILE *uci_open_stream(struct uci_context *ctx, const char *filename, c
 __private void uci_close_stream(FILE *stream);
 __private void uci_getln(struct uci_context *ctx, int offset);
 
-__private void uci_parse_error(struct uci_context *ctx, char *pos, char *reason);
+__private void uci_parse_error(struct uci_context *ctx, char *reason);
 __private void uci_alloc_parse_context(struct uci_context *ctx);
 
 __private void uci_cleanup(struct uci_context *ctx);
@@ -65,17 +71,17 @@ __private int uci_load_delta(struct uci_context *ctx, struct uci_package *p, boo
 
 static inline bool uci_validate_package(const char *str)
 {
-	return uci_validate_str(str, false);
+	return uci_validate_str(str, false, true);
 }
 
 static inline bool uci_validate_type(const char *str)
 {
-	return uci_validate_str(str, false);
+	return uci_validate_str(str, false, false);
 }
 
 static inline bool uci_validate_name(const char *str)
 {
-	return uci_validate_str(str, true);
+	return uci_validate_str(str, true, false);
 }
 
 /* initialize a list head/item */

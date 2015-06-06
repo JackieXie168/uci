@@ -66,13 +66,56 @@ uci_free_delta(struct uci_delta *h)
 	uci_free_element(&h->e);
 }
 
+static void uci_delta_save(struct uci_context *ctx, FILE *f,
+			const char *name, const struct uci_delta *h)
+{
+	const struct uci_element *e = &h->e;
+	char prefix[2] = {0, 0};
+
+	if (h->cmd <= __UCI_CMD_LAST)
+		prefix[0] = uci_command_char[h->cmd];
+
+	fprintf(f, "%s%s.%s", prefix, name, h->section);
+	if (e->name)
+		fprintf(f, ".%s", e->name);
+
+	if (h->cmd == UCI_CMD_REMOVE && !h->value)
+		fprintf(f, "\n");
+	else {
+		int i;
+
+		fprintf(f, "='");
+		for (i = 0; h->value[i]; i++) {
+			unsigned char c = h->value[i];
+			if (c != '\'')
+				fputc(c, f);
+			else
+				fprintf(f, "'\\''");
+		}
+		fprintf(f, "'\n");
+	}
+}
 
 int uci_set_savedir(struct uci_context *ctx, const char *dir)
 {
 	char *sdir;
+	struct uci_element *e, *tmp;
+	bool exists = false;
 
 	UCI_HANDLE_ERR(ctx);
 	UCI_ASSERT(ctx, dir != NULL);
+
+	/* Move dir to the end of ctx->delta_path */
+	uci_foreach_element_safe(&ctx->delta_path, tmp, e) {
+		if (!strcmp(e->name, dir)) {
+			exists = true;
+			uci_list_del(&e->list);
+			break;
+		}
+	}
+	if (!exists)
+		e = uci_alloc_generic(ctx, UCI_TYPE_PATH, dir, sizeof(struct uci_element));
+	uci_list_add(&ctx->delta_path, &e->list);
 
 	sdir = uci_strdup(ctx, dir);
 	if (ctx->savedir != uci_savedir)
@@ -84,45 +127,53 @@ int uci_set_savedir(struct uci_context *ctx, const char *dir)
 int uci_add_delta_path(struct uci_context *ctx, const char *dir)
 {
 	struct uci_element *e;
+	struct uci_list *savedir;
 
 	UCI_HANDLE_ERR(ctx);
 	UCI_ASSERT(ctx, dir != NULL);
+
+	/* Duplicate delta path is not allowed */
+	uci_foreach_element(&ctx->delta_path, e) {
+		if (!strcmp(e->name, dir))
+			UCI_THROW(ctx, UCI_ERR_DUPLICATE);
+	}
+
 	e = uci_alloc_generic(ctx, UCI_TYPE_PATH, dir, sizeof(struct uci_element));
-	uci_list_add(&ctx->delta_path, &e->list);
+	/* Keep savedir at the end of ctx->delta_path list */
+	savedir = ctx->delta_path.prev;
+	uci_list_insert(savedir->prev, &e->list);
 
 	return 0;
 }
 
-static inline int uci_parse_delta_tuple(struct uci_context *ctx, char **buf, struct uci_ptr *ptr)
-{
-	int c = UCI_CMD_CHANGE;
+char const uci_command_char[] = {
+	[UCI_CMD_ADD] = '+',
+	[UCI_CMD_REMOVE] = '-',
+	[UCI_CMD_CHANGE] = 0,
+	[UCI_CMD_RENAME] = '@',
+	[UCI_CMD_REORDER] = '^',
+	[UCI_CMD_LIST_ADD] = '|',
+	[UCI_CMD_LIST_DEL] = '~'
+};
 
-	switch(**buf) {
-	case '^':
-		c = UCI_CMD_REORDER;
-		break;
-	case '-':
-		c = UCI_CMD_REMOVE;
-		break;
-	case '@':
-		c = UCI_CMD_RENAME;
-		break;
-	case '+':
-		/* UCI_CMD_ADD is used for anonymous sections or list values */
-		c = UCI_CMD_ADD;
-		break;
-	case '|':
-		c = UCI_CMD_LIST_ADD;
-		break;
-	case '~':
-		c = UCI_CMD_LIST_DEL;
-		break;
+static inline int uci_parse_delta_tuple(struct uci_context *ctx, struct uci_ptr *ptr)
+{
+	struct uci_parse_context *pctx = ctx->pctx;
+	char *str = pctx_cur_str(pctx), *arg;
+	int c;
+
+	UCI_INTERNAL(uci_parse_argument, ctx, ctx->pctx->file, &str, &arg);
+	for (c = 0; c <= __UCI_CMD_LAST; c++) {
+		if (uci_command_char[c] == *arg)
+			break;
 	}
+	if (c > __UCI_CMD_LAST)
+		c = UCI_CMD_CHANGE;
 
 	if (c != UCI_CMD_CHANGE)
-		*buf += 1;
+		arg += 1;
 
-	UCI_INTERNAL(uci_parse_ptr, ctx, ptr, *buf);
+	UCI_INTERNAL(uci_parse_ptr, ctx, ptr, arg);
 
 	if (!ptr->section)
 		goto error;
@@ -153,13 +204,13 @@ error:
 	return 0;
 }
 
-static void uci_parse_delta_line(struct uci_context *ctx, struct uci_package *p, char *buf)
+static void uci_parse_delta_line(struct uci_context *ctx, struct uci_package *p)
 {
 	struct uci_element *e = NULL;
 	struct uci_ptr ptr;
 	int cmd;
 
-	cmd = uci_parse_delta_tuple(ctx, &buf, &ptr);
+	cmd = uci_parse_delta_tuple(ctx, &ptr);
 	if (strcmp(ptr.package, p->e.name) != 0)
 		goto error;
 
@@ -212,6 +263,7 @@ static int uci_parse_delta(struct uci_context *ctx, FILE *stream, struct uci_pac
 	pctx->file = stream;
 
 	while (!feof(pctx->file)) {
+		pctx->pos = 0;
 		uci_getln(ctx, 0);
 		if (!pctx->buf[0])
 			continue;
@@ -221,7 +273,7 @@ static int uci_parse_delta(struct uci_context *ctx, FILE *stream, struct uci_pac
 		 * delta as possible
 		 */
 		UCI_TRAP_SAVE(ctx, error);
-		uci_parse_delta_line(ctx, p, pctx->buf);
+		uci_parse_delta_line(ctx, p);
 		UCI_TRAP_RESTORE(ctx);
 		changes++;
 error:
@@ -241,13 +293,15 @@ static int uci_load_delta_file(struct uci_context *ctx, struct uci_package *p, c
 
 	UCI_TRAP_SAVE(ctx, done);
 	stream = uci_open_stream(ctx, filename, NULL, SEEK_SET, flush, false);
+	UCI_TRAP_RESTORE(ctx);
+
 	if (p)
 		changes = uci_parse_delta(ctx, stream, p);
-	UCI_TRAP_RESTORE(ctx);
+
 done:
 	if (f)
 		*f = stream;
-	else if (stream)
+	else
 		uci_close_stream(stream);
 	return changes;
 }
@@ -267,21 +321,25 @@ __private int uci_load_delta(struct uci_context *ctx, struct uci_package *p, boo
 		if ((asprintf(&filename, "%s/%s", e->name, p->e.name) < 0) || !filename)
 			UCI_THROW(ctx, UCI_ERR_MEM);
 
-		uci_load_delta_file(ctx, p, filename, NULL, false);
+		changes += uci_load_delta_file(ctx, p, filename, NULL, false);
 		free(filename);
 	}
 
 	if ((asprintf(&filename, "%s/%s", ctx->savedir, p->e.name) < 0) || !filename)
 		UCI_THROW(ctx, UCI_ERR_MEM);
+	UCI_TRAP_SAVE(ctx, done);
+	f = uci_open_stream(ctx, filename, NULL, SEEK_SET, flush, false);
+	UCI_TRAP_RESTORE(ctx);
 
-	changes = uci_load_delta_file(ctx, p, filename, &f, flush);
 	if (flush && f && (changes > 0)) {
-		rewind(f);
 		if (ftruncate(fileno(f), 0) < 0) {
+			free(filename);
 			uci_close_stream(f);
 			UCI_THROW(ctx, UCI_ERR_IO);
 		}
 	}
+
+done:
 	free(filename);
 	uci_close_stream(f);
 	ctx->err = 0;
@@ -308,31 +366,29 @@ static void uci_filter_delta(struct uci_context *ctx, const char *name, const ch
 	f = uci_open_stream(ctx, filename, NULL, SEEK_SET, true, false);
 	pctx->file = f;
 	while (!feof(f)) {
-		struct uci_element *e;
-		char *buf;
+		enum uci_command c;
+		bool match;
 
+		pctx->pos = 0;
 		uci_getln(ctx, 0);
-		buf = pctx->buf;
-		if (!buf[0])
+		if (!pctx->buf[0])
 			continue;
 
-		/* NB: need to allocate the element before the call to
-		 * uci_parse_delta_tuple, otherwise the original string
-		 * gets modified before it is saved */
-		e = uci_alloc_generic(ctx, UCI_TYPE_DELTA, pctx->buf, sizeof(struct uci_element));
-		uci_list_add(&list, &e->list);
-
-		uci_parse_delta_tuple(ctx, &buf, &ptr);
+		c = uci_parse_delta_tuple(ctx, &ptr);
+		match = true;
 		if (section) {
 			if (!ptr.section || (strcmp(section, ptr.section) != 0))
-				continue;
+				match = false;
 		}
-		if (option) {
+		if (match && option) {
 			if (!ptr.option || (strcmp(option, ptr.option) != 0))
-				continue;
+				match = false;
 		}
-		/* match, drop this element again */
-		uci_free_element(e);
+
+		if (!match) {
+			uci_add_delta(ctx, &list, c,
+				ptr.section, ptr.option, ptr.value);
+		}
 	}
 
 	/* rebuild the delta file */
@@ -340,8 +396,9 @@ static void uci_filter_delta(struct uci_context *ctx, const char *name, const ch
 	if (ftruncate(fileno(f), 0) < 0)
 		UCI_THROW(ctx, UCI_ERR_IO);
 	uci_foreach_element_safe(&list, tmp, e) {
-		fprintf(f, "%s\n", e->name);
-		uci_free_element(e);
+		struct uci_delta *h = uci_to_delta(e);
+		uci_delta_save(ctx, f, name, h);
+		uci_free_delta(h);
 	}
 	UCI_TRAP_RESTORE(ctx);
 
@@ -349,7 +406,7 @@ done:
 	free(filename);
 	uci_close_stream(pctx->file);
 	uci_foreach_element_safe(&list, tmp, e) {
-		uci_free_element(e);
+		uci_free_delta(uci_to_delta(e));
 	}
 	uci_cleanup(ctx);
 }
@@ -440,39 +497,7 @@ int uci_save(struct uci_context *ctx, struct uci_package *p)
 
 	uci_foreach_element_safe(&p->delta, tmp, e) {
 		struct uci_delta *h = uci_to_delta(e);
-		char *prefix = "";
-
-		switch(h->cmd) {
-		case UCI_CMD_REMOVE:
-			prefix = "-";
-			break;
-		case UCI_CMD_RENAME:
-			prefix = "@";
-			break;
-		case UCI_CMD_ADD:
-			prefix = "+";
-			break;
-		case UCI_CMD_REORDER:
-			prefix = "^";
-			break;
-		case UCI_CMD_LIST_ADD:
-			prefix = "|";
-			break;
-		case UCI_CMD_LIST_DEL:
-			prefix = "~";
-			break;
-		default:
-			break;
-		}
-
-		fprintf(f, "%s%s.%s", prefix, p->e.name, h->section);
-		if (e->name)
-			fprintf(f, ".%s", e->name);
-
-		if (h->cmd == UCI_CMD_REMOVE && !h->value)
-			fprintf(f, "\n");
-		else
-			fprintf(f, "=%s\n", h->value);
+		uci_delta_save(ctx, f, p->e.name, h);
 		uci_free_delta(h);
 	}
 

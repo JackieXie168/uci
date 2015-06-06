@@ -69,18 +69,22 @@ __private char *uci_strdup(struct uci_context *ctx, const char *str)
  * for names, only alphanum and _ is allowed (shell compatibility)
  * for types, we allow more characters
  */
-__private bool uci_validate_str(const char *str, bool name)
+__private bool uci_validate_str(const char *str, bool name, bool package)
 {
 	if (!*str)
 		return false;
 
-	while (*str) {
+	for (; *str; str++) {
 		unsigned char c = *str;
-		if (!isalnum(c) && c != '_') {
-			if (name || (c < 33) || (c > 126))
-				return false;
-		}
-		str++;
+
+		if (isalnum(c) || c == '_')
+			continue;
+
+		if (c == '-' && package)
+			continue;
+
+		if (name || (c < 33) || (c > 126))
+			return false;
 	}
 	return true;
 }
@@ -89,9 +93,10 @@ bool uci_validate_text(const char *str)
 {
 	while (*str) {
 		unsigned char c = *str;
-		if ((c == '\r') || (c == '\n') ||
-			((c < 32) && (c != '\t')))
+
+		if (c < 32 && c != '\t' && c != '\n' && c != '\r')
 			return false;
+
 		str++;
 	}
 	return true;
@@ -161,12 +166,12 @@ error:
 }
 
 
-__private void uci_parse_error(struct uci_context *ctx, char *pos, char *reason)
+__private void uci_parse_error(struct uci_context *ctx, char *reason)
 {
 	struct uci_parse_context *pctx = ctx->pctx;
 
 	pctx->reason = reason;
-	pctx->byte = pos - pctx->buf;
+	pctx->byte = pctx_pos(pctx);
 	UCI_THROW(ctx, UCI_ERR_PARSE);
 }
 
