@@ -113,11 +113,8 @@ find_package(lua_State *L, struct uci_context *ctx, const char *str, bool al)
 		goto done;
 	}
 
-	if (al == true)
+	if (al)
 		uci_load(ctx, name, &p);
-	else if (al) {
-		uci_load(ctx, name, &p);
-	}
 
 done:
 	if (name != str)
@@ -303,7 +300,7 @@ uci_lua_foreach(lua_State *L)
 	ctx = find_context(L, &offset);
 	package = luaL_checkstring(L, 1 + offset);
 
-	if (lua_isnil(L, 2))
+	if (lua_isnil(L, 2 + offset))
 		type = NULL;
 	else
 		type = luaL_checkstring(L, 2 + offset);
