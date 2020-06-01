@@ -87,9 +87,10 @@ static char *
 uci_lookup_section_ref(struct uci_section *s)
 {
 	struct uci_type_list *ti = type_list;
+	char *ret;
 	int maxlen;
 
-	if (!s->anonymous || !(flags & CLI_FLAG_SHOW_EXT))
+	if (!(flags & CLI_FLAG_SHOW_EXT))
 		return s->e.name;
 
 	/* look up in section type list */
@@ -108,19 +109,33 @@ uci_lookup_section_ref(struct uci_section *s)
 		ti->name = s->type;
 	}
 
-	maxlen = strlen(s->type) + 1 + 2 + 10;
-	if (!typestr) {
-		typestr = malloc(maxlen);
-	} else {
-		typestr = realloc(typestr, maxlen);
-	}
+	if (s->anonymous) {
+		maxlen = strlen(s->type) + 1 + 2 + 10;
+		if (!typestr) {
+			typestr = malloc(maxlen);
+			if (!typestr)
+				return NULL;
+		} else {
+			void *p = realloc(typestr, maxlen);
+			if (!p) {
+				free(typestr);
+				return NULL;
+			}
 
-	if (typestr)
-		sprintf(typestr, "@%s[%d]", ti->name, ti->idx);
+			typestr = p;
+		}
+
+		if (typestr)
+			sprintf(typestr, "@%s[%d]", ti->name, ti->idx);
+
+		ret = typestr;
+	} else {
+		ret = s->e.name;
+	}
 
 	ti->idx++;
 
-	return typestr;
+	return ret;
 }
 
 static void uci_usage(void)
@@ -170,6 +185,7 @@ static void cli_perror(void)
 	uci_perror(ctx, appname);
 }
 
+__attribute__((format(printf, 1, 2)))
 static void cli_error(const char *fmt, ...)
 {
 	va_list ap;
@@ -556,7 +572,7 @@ static int uci_batch_cmd(void)
 			return 1;
 		}
 		argv[i] = NULL;
-		if ((ret = uci_parse_argument(ctx, input, &str, &argv[i])) != UCI_OK) {
+		if (uci_parse_argument(ctx, input, &str, &argv[i]) != UCI_OK) {
 			cli_perror();
 			i = 0;
 			break;

@@ -6,11 +6,13 @@ CHANGES_DIR="/tmp/.uci"
 TMP_DIR=${TESTS_DIR}"/tmp"
 FULL_SUITE=${TESTS_DIR}"/full_suite.sh"
 
-UCI_BIN="../uci"
-[ -x $UCI_BIN ] || {
+UCI_BIN=${UCI_BIN:-"../uci"}
+[ -x "$UCI_BIN" ] || {
 	echo "uci is not present." >&2
 	return 1
 }
+VALGRIND="valgrind --quiet --show-leak-kinds=all --leak-check=full --track-origins=yes"
+UCI_BIN="${VALGRIND} ${UCI_BIN}"
 UCI="${UCI_BIN} -c ${CONFIG_DIR} -p ${CHANGES_DIR}"
 UCI_Q="${UCI_BIN} -c ${CONFIG_DIR} -p ${CHANGES_DIR} -q"
 
@@ -60,9 +62,9 @@ assertFailWithNoReturn() {
 }
 EOF
 
-for suite in $(ls ${SCRIPTS_DIR}/*)
+for suite in "${SCRIPTS_DIR}"/*
 do
-	cat ${suite} >> ${FULL_SUITE}
+	cat "${suite}" >> ${FULL_SUITE}
 done
 
 echo ". ${DO_TEST}" >> ${FULL_SUITE}

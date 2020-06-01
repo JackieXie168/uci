@@ -28,6 +28,7 @@
 #include <glob.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 
 #include "uci.h"
 #include "uci_internal.h"
@@ -70,8 +71,6 @@ __private void uci_getln(struct uci_context *ctx, int offset)
 
 		pctx->bufsz *= 2;
 		pctx->buf = uci_realloc(ctx, pctx->buf, pctx->bufsz);
-		if (!pctx->buf)
-			UCI_THROW(ctx, UCI_ERR_MEM);
 	} while (1);
 }
 
@@ -410,7 +409,6 @@ static void uci_parse_config(struct uci_context *ctx)
 	char *name;
 	char *type;
 
-	uci_fixup_section(ctx, ctx->pctx->section);
 	if (!ctx->pctx->package) {
 		if (!ctx->pctx->name)
 			uci_parse_error(ctx, "attempting to import a file without a package name");
@@ -427,9 +425,9 @@ static void uci_parse_config(struct uci_context *ctx)
 		uci_parse_error(ctx, "invalid character in type field");
 
 	ofs_name = next_arg(ctx, false, true, false);
+	assert_eol(ctx);
 	type = pctx_str(pctx, ofs_type);
 	name = pctx_str(pctx, ofs_name);
-	assert_eol(ctx);
 
 	if (!name || !name[0]) {
 		ctx->internal = !pctx->merge;
@@ -437,8 +435,13 @@ static void uci_parse_config(struct uci_context *ctx)
 	} else {
 		uci_fill_ptr(ctx, &ptr, &pctx->package->e);
 		e = uci_lookup_list(&pctx->package->sections, name);
-		if (e)
+		if (e) {
 			ptr.s = uci_to_section(e);
+
+			if ((ctx->flags & UCI_FLAG_STRICT) && strcmp(ptr.s->type, type))
+				uci_parse_error(ctx, "section of different type overwrites prior section with same name");
+		}
+
 		ptr.section = name;
 		ptr.value = type;
 
@@ -468,9 +471,9 @@ static void uci_parse_option(struct uci_context *ctx, bool list)
 
 	ofs_name = next_arg(ctx, true, true, false);
 	ofs_value = next_arg(ctx, false, false, false);
+	assert_eol(ctx);
 	name = pctx_str(pctx, ofs_name);
 	value = pctx_str(pctx, ofs_value);
-	assert_eol(ctx);
 
 	uci_fill_ptr(ctx, &ptr, &pctx->section->e);
 	e = uci_lookup_list(&pctx->section->options, name);
@@ -566,7 +569,7 @@ static const char *uci_escape(struct uci_context *ctx, const char *str)
 		len = end - str;
 
 		/* make sure that we have enough room in the buffer */
-		while (ofs + len + sizeof(UCI_QUOTE_ESCAPE) + 1 > ctx->bufsz) {
+		while (ofs + len + (int) sizeof(UCI_QUOTE_ESCAPE) + 1 > ctx->bufsz) {
 			ctx->bufsz *= 2;
 			ctx->buf = uci_realloc(ctx, ctx->buf, ctx->bufsz);
 		}
@@ -686,7 +689,6 @@ error:
 			UCI_THROW(ctx, ctx->err);
 	}
 
-	uci_fixup_section(ctx, ctx->pctx->section);
 	if (!pctx->package && name)
 		uci_switch_config(ctx);
 	if (package)
@@ -719,11 +721,12 @@ static void uci_file_commit(struct uci_context *ctx, struct uci_package **packag
 {
 	struct uci_package *p = *package;
 	FILE *f1, *f2 = NULL;
-	char *name = NULL;
-	char *path = NULL;
+	char *volatile name = NULL;
+	char *volatile path = NULL;
 	char *filename = NULL;
 	struct stat statbuf;
-	bool do_rename = false;
+	volatile bool do_rename = false;
+	int fd;
 
 	if (!p->path) {
 		if (overwrite)
@@ -734,17 +737,6 @@ static void uci_file_commit(struct uci_context *ctx, struct uci_package **packag
 
 	if ((asprintf(&filename, "%s/.%s.uci-XXXXXX", ctx->confdir, p->e.name) < 0) || !filename)
 		UCI_THROW(ctx, UCI_ERR_MEM);
-
-	if (!mktemp(filename))
-		*filename = 0;
-
-	if (!*filename) {
-		free(filename);
-		UCI_THROW(ctx, UCI_ERR_IO);
-	}
-
-	if ((stat(filename, &statbuf) == 0) && ((statbuf.st_mode & S_IFMT) != S_IFREG))
-		UCI_THROW(ctx, UCI_ERR_IO);
 
 	/* open the config file for writing now, so that it is locked */
 	f1 = uci_open_stream(ctx, p->path, NULL, SEEK_SET, true, true);
@@ -780,7 +772,20 @@ static void uci_file_commit(struct uci_context *ctx, struct uci_package **packag
 			goto done;
 	}
 
-	f2 = uci_open_stream(ctx, filename, p->path, SEEK_SET, true, true);
+	fd = mkstemp(filename);
+	if (fd == -1)
+		UCI_THROW(ctx, UCI_ERR_IO);
+
+	if ((flock(fd, LOCK_EX) < 0) && (errno != ENOSYS))
+		UCI_THROW(ctx, UCI_ERR_IO);
+
+	if (lseek(fd, 0, SEEK_SET) < 0)
+		UCI_THROW(ctx, UCI_ERR_IO);
+
+	f2 = fdopen(fd, "w+");
+	if (!f2)
+		UCI_THROW(ctx, UCI_ERR_IO);
+
 	uci_export(ctx, f2, p, false);
 
 	fflush(f2);
@@ -795,9 +800,13 @@ done:
 	free(name);
 	free(path);
 	uci_close_stream(f1);
-	if (do_rename && rename(filename, p->path)) {
-		unlink(filename);
-		UCI_THROW(ctx, UCI_ERR_IO);
+	if (do_rename) {
+		path = realpath(p->path, NULL);
+		if (!path || stat(path, &statbuf) || chmod(filename, statbuf.st_mode) || rename(filename, path)) {
+			unlink(filename);
+			UCI_THROW(ctx, UCI_ERR_IO);
+		}
+		free(path);
 	}
 	free(filename);
 	if (ctx->err)
@@ -826,7 +835,8 @@ static char **uci_list_config_files(struct uci_context *ctx)
 {
 	char **configs;
 	glob_t globbuf;
-	int size, i;
+	int size, j, skipped;
+	size_t i;
 	char *buf;
 	char *dir;
 
@@ -838,18 +848,22 @@ static char **uci_list_config_files(struct uci_context *ctx)
 	}
 
 	size = sizeof(char *) * (globbuf.gl_pathc + 1);
+	skipped = 0;
 	for(i = 0; i < globbuf.gl_pathc; i++) {
 		char *p;
 
 		p = get_filename(globbuf.gl_pathv[i]);
-		if (!p)
+		if (!p) {
+			skipped++;
 			continue;
+		}
 
 		size += strlen(p) + 1;
 	}
 
-	configs = uci_malloc(ctx, size);
-	buf = (char *) &configs[globbuf.gl_pathc + 1];
+	configs = uci_malloc(ctx, size - skipped);
+	buf = (char *) &configs[globbuf.gl_pathc + 1 - skipped];
+	j = 0;
 	for(i = 0; i < globbuf.gl_pathc; i++) {
 		char *p;
 
@@ -860,7 +874,7 @@ static char **uci_list_config_files(struct uci_context *ctx)
 		if (!uci_validate_package(p))
 			continue;
 
-		configs[i] = buf;
+		configs[j++] = buf;
 		strcpy(buf, p);
 		buf += strlen(buf) + 1;
 	}
@@ -869,12 +883,13 @@ static char **uci_list_config_files(struct uci_context *ctx)
 	return configs;
 }
 
-static struct uci_package *uci_file_load(struct uci_context *ctx, const char *name)
+static struct uci_package *uci_file_load(struct uci_context *ctx,
+					 const char *volatile name)
 {
 	struct uci_package *package = NULL;
 	char *filename;
 	bool confdir;
-	FILE *file = NULL;
+	FILE *volatile file = NULL;
 
 	switch (name[0]) {
 	case '.':
